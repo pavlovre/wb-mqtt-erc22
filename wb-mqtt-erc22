@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+import sys
+import json
+import asyncio
+
+from serial import Serial, SerialException
+
+from wb_common.mqtt_client import MQTTClient
+
+class AsyncServer:
+    _client: MQTTClient
+    _device_prefix = 'erc22'
+    _driver_name = 'wb-mqtt-erc22'
+    _driver_title_en = 'ERC22-485 Converter Gateway'
+
+    def __init__(self, debug: bool, verbose: bool, device_id: int, port: str, baudrate=None, parity=None, bytesize=None, stopbits=None):
+        self._debug = debug
+        self._verbose = verbose
+        self._device_id = device_id
+        self._port = port
+        self._running = False
+        
+        # Словарь для отслеживания опубликованных контролов: control_id -> switch_type
+        self._published_controls = {}
+        
+        try:
+            # Используем неблокирующий режим для serial порта
+            self._serial = Serial(port, baudrate=baudrate, timeout=0,  # timeout=0 для неблокирующего чтения
+                                  parity=parity, bytesize=bytesize, stopbits=stopbits)
+        except SerialException as e:
+            print(f"ERROR: Failed to open serial port {port}: {e}")
+            raise
+            
+        # Создаём MQTT клиент в неблокирующем режиме
+        self._client = MQTTClient(self._driver_name, is_threaded=False)
+        self._topic_device = f"/devices/{self._device_prefix}_{device_id}"
+        self._topic_device_controls = f"{self._topic_device}/controls"
+        self._topic_device_meta = f"{self._topic_device}/meta"
+        self._topic_device_error = f"{self._topic_device_meta}/error"
+        self._topic_device_debug = f"{self._topic_device_meta}/debug"
+
+    async def start(self):
+        """Асинхронный запуск сервера"""
+        self._running = True
+        self._client.start()
+        
+        try:
+            # Публикуем метаданные устройства
+            meta = json.dumps({
+                "driver": self._driver_name, 
+                "title": {"en": f"{self._driver_title_en} ({self._port})"}
+            })
+            self._publish(self._topic_device_meta, meta)
+            self._publish(f"{self._topic_device_meta}/name", f"{self._driver_title_en} ({self._port})")
+            
+            print(f"Started server for device {self._device_id} on port {self._port}")
+            
+            buffer = bytearray()
+            
+            while self._running:
+                try:
+                    # Неблокирующее чтение данных
+                    data = self._serial.read(100)  # Читаем больше данных за раз
+                    if data:
+                        buffer.extend(data)
+                        
+                        # Обрабатываем все полные сообщения в буфере
+                        while len(buffer) >= 11:
+                            # Ищем начало сообщения
+                            start_idx = buffer.find(0x7E)
+                            if start_idx == -1:
+                                buffer.clear()
+                                break
+                            
+                            # Удаляем данные до начала сообщения
+                            if start_idx > 0:
+                                buffer = buffer[start_idx:]
+                            
+                            # Проверяем, есть ли полное сообщение
+                            if len(buffer) < 11:
+                                break
+                            
+                            raw_data = bytes(buffer[:11])
+                            await self._process_message(raw_data)
+                            
+                            # Удаляем обработанное сообщение из буфера
+                            buffer = buffer[11:]
+                    
+                    # Обрабатываем MQTT события
+                    self._client.loop(timeout=0.001)
+                    
+                    # Небольшая пауза для предотвращения 100% загрузки CPU
+                    await asyncio.sleep(0.001)
+                    
+                except SerialException:
+                    self._publish(self._topic_device_error, "r")
+                    await asyncio.sleep(0.1)  # Пауза при ошибке
+                    
+        except Exception as e:
+            print(f"ERROR in server for device {self._device_id} on port {self._port}: {e}")
+        finally:
+            self.stop()
+
+    async def _process_message(self, raw_data: bytes):
+        """Асинхронная обработка сообщения"""
+        if self._debug:
+            self._publish(f"{self._topic_device_debug}", self._to_hex(raw_data))
+
+        # Проверяем формат сообщения
+        if not (len(raw_data) == 11
+                and raw_data[0] == 0x7E
+                and raw_data[1] == 0x08
+                and raw_data[2] == 0x0D
+                and raw_data[8] == 0xEF
+                and raw_data[10] == 0x0D):
+            self._publish(self._topic_device_error, "r")
+            return
+
+        control_id = raw_data[3:7].hex()
+        switch_type = raw_data[7]
+        key_value = raw_data[9]
+
+        control_topic = f"{self._topic_device_controls}/{control_id}"
+        self._publish(control_topic, key_value)
+
+        # Публикуем метаданные только если контрол новый или изменился его тип
+        if control_id not in self._published_controls or self._published_controls[control_id] != switch_type:
+            control_meta = json.dumps({"type": "switch", "readonly": True, "order": 1,
+                                       "title": {"en": self._control_title(switch_type)}})
+            self._publish(f"{control_topic}/meta", control_meta)
+            self._publish(f"{control_topic}/meta/type", 'switch')
+            self._publish(f"{control_topic}/meta/readonly", 'true')
+            self._publish(f"{control_topic}/meta/order", 1)
+            
+            # Запоминаем, что метаданные для этого контрола опубликованы
+            self._published_controls[control_id] = switch_type
+
+    def stop(self):
+        """Остановка сервера - теперь простая и понятная"""
+        self._running = False
+        
+        if self._serial and self._serial.is_open:
+            self._serial.close()
+        
+        if self._client:
+            self._client.stop()
+        
+        print(f"Stopped server for device {self._device_id} on port {self._port}")
+
+    def _publish(self, topic, data):
+        self._client.publish(topic, data, qos=1, retain=True)
+        if self._verbose:
+            print(f"[{self._port}] {topic}: {data}")
+
+    @staticmethod
+    def _control_title(switch_type: int):
+        if switch_type == 1:
+            return "Rocking Switch"
+        if switch_type == 2:
+            return "Rebound Switch"
+        return "Switch"
+
+    @staticmethod
+    def _to_hex(s):
+        return " ".join(bytes([c]).hex().upper() for c in s)
+
+
+async def run_all_servers(servers):
+    """Асинхронно запускает все серверы"""
+    print(f"Starting {len(servers)} server(s) asynchronously")
+    
+    # Запускаем все серверы одновременно
+    tasks = [server.start() for server in servers]
+    
+    try:
+        await asyncio.gather(*tasks)
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        # Останавливаем все серверы
+        for server in servers:
+            server.stop()
+
+
+async def main_async():
+    """Асинхронная главная функция"""
+    if len(sys.argv) > 2:
+        print(f"USAGE: {sys.argv[0]} [<config file>]")
+        return 1
+
+    filename = sys.argv[1] if len(sys.argv) == 2 else '/etc/wb-mqtt-erc22.conf'
+    
+    try:
+        with open(filename) as f:
+            conf = json.load(f)
+    except FileNotFoundError:
+        print(f"ERROR: Configuration file {filename} not found")
+        return 1
+    except json.JSONDecodeError as e:
+        print(f"ERROR: Invalid JSON in configuration file {filename}: {e}")
+        return 1
+
+    conf.setdefault('debug', False)
+    conf.setdefault('verbose', False)
+    conf.setdefault('ports', [])
+    
+    if len(conf['ports']) == 0:
+        print(f"ERROR: configuration section 'ports' is missing or empty in {filename}")
+        return 1
+
+    # Фильтруем только включенные порты
+    enabled_ports = [port for port in conf['ports'] if port.get('enabled', True)]
+    
+    if len(enabled_ports) == 0:
+        print(f"ERROR: no enabled ports found in configuration {filename}")
+        return 1
+
+    print(f"Found {len(enabled_ports)} enabled port(s) out of {len(conf['ports'])} total")
+
+    # Проверяем конфигурацию портов перед созданием серверов
+    for i, port_config in enumerate(enabled_ports, 1):
+        # Проверяем обязательный параметр path
+        if 'path' not in port_config:
+            print(f"ERROR: Missing required parameter 'path' in port configuration #{i}")
+            return 1
+        
+        if not port_config['path'] or not isinstance(port_config['path'], str):
+            print(f"ERROR: Parameter 'path' in port configuration #{i} must be a non-empty string")
+            return 1
+        
+        # Устанавливаем значения по умолчанию для остальных параметров
+        port_config.setdefault('baud_rate', 9600)
+        port_config.setdefault('parity', 'N')
+        port_config.setdefault('data_bits', 8)
+        port_config.setdefault('stop_bits', 1)
+
+    servers = []
+    
+    # Создаем сервер для каждого включенного порта
+    for i, port_config in enumerate(enabled_ports, 1):
+        try:
+            server = AsyncServer(
+                conf['debug'], 
+                conf['verbose'], 
+                i,  # device_id основан на порядке включенных портов
+                port_config['path'],
+                port_config['baud_rate'],
+                port_config['parity'], 
+                port_config['data_bits'], 
+                port_config['stop_bits']
+            )
+            servers.append(server)
+            print(f"Configured server {i} for port {port_config['path']}")
+            
+        except SerialException as e:
+            print(f"WARNING: Failed to initialize server for port {port_config['path']}: {e}")
+            continue
+        except Exception as e:
+            print(f"ERROR: Unexpected error initializing server for port {port_config['path']}: {e}")
+            return 1
+
+    if len(servers) == 0:
+        print("ERROR: No servers could be initialized")
+        return 1
+
+    print(f"Successfully initialized {len(servers)} server(s)")
+    
+    try:
+        await run_all_servers(servers)
+    except KeyboardInterrupt:
+        print("\nReceived interrupt signal")
+    
+    return 0
+
+
+def main():
+    """Синхронная обёртка для асинхронной главной функции"""
+    try:
+        return asyncio.run(main_async())
+    except KeyboardInterrupt:
+        print("\nProgram interrupted")
+        return 0
+    except Exception as exception:
+        print(f"FATAL ERROR: {exception}")
+        return 1
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nProgram interrupted")
+        sys.exit(0)
+    except Exception as fatal_exception:
+        print(f"FATAL ERROR: {fatal_exception}")
+        sys.exit(1)

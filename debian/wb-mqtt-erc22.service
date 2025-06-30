@@ -1,0 +1,19 @@
+[Unit]
+Description=ERC22-485 Converter MQTT Gateway
+Wants=wb-hwconf-manager.service wb-modules.service
+After=network.target wb-hwconf-manager.service wb-modules.service
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=10
+User=root
+ExecStart=/usr/bin/python3 -u /usr/bin/wb-mqtt-erc22
+KillMode=process
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wb-mqtt-erc22
+
+[Install]
+WantedBy=multi-user.target
+Alias=wb-mqtt-erc22.service
