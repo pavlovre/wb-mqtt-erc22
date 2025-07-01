@@ -111,7 +111,7 @@ class AsyncServer:
                 and raw_data[0] == 0x7E
                 and raw_data[1] == 0x08
                 and raw_data[2] == 0x0D
-                and raw_data[8] == 0xEF
+                and (raw_data[8] == 0xEF or raw_data[8] == 0x01)
                 and raw_data[10] == 0x0D):
             self._publish(self._topic_device_error, "r")
             return
